@@ -1,40 +1,71 @@
+using Azure.Core;
+using Azure.Core.Pipeline;
+using Azure.ResourceManager;
+using Azure.ResourceManager.FrontDoor;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Xunit.Abstractions;
+
 namespace FauxDoor.Tests;
 
-public class UnitTest1
+public class UnitTest1(ITestOutputHelper outputHelper)
 {
     [Fact]
     public async Task Test1()
     {
-        await using var fixture = await FauxDoorFixture.Create();
+        await using var fixture = await FauxDoorFixture.Create(outputHelper);
+
+        var serviceCollection = new ServiceCollection();
+        serviceCollection.AddHttpClient("arm-client");
+        serviceCollection.AddLogging(builder =>
+        {
+            builder.AddXUnit(outputHelper);
+        });
+        var services       = serviceCollection.BuildServiceProvider();
+        var loggingClient  = services.GetRequiredService<IHttpClientFactory>().CreateClient("arm-client");
+        var innerTransport = new HttpClientTransport(loggingClient);
+        var baseUri        = new Uri(fixture.Server.ApiUrl);
+        var armClientOptions = new ArmClientOptions
+        {
+            Transport = new ResetBaseUriTransport(baseUri, innerTransport)
+        };
+        var subscriptionId = Guid.Parse("5038B8A1-D1A6-4B00-8A2F-205775B6A700").ToString();
+        var armClient      = new ArmClient(DummyCredential.Instance, subscriptionId, armClientOptions);
+        var subscription   = await armClient.GetDefaultSubscriptionAsync();
+        var frontDoors     = subscription.GetFrontDoors();
     }
 }
 
-public class FauxDoorFixture : IAsyncDisposable
+public class DummyCredential : TokenCredential
 {
-    private readonly FauxDoorServer _server;
+    public static readonly TokenCredential Instance = new DummyCredential();
 
-    private FauxDoorFixture(FauxDoorServer server) 
-        => _server = server;
+    public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken) 
+        => new("dummy", DateTimeOffset.MaxValue);
 
-    public static async Task<FauxDoorFixture> Create()
+    public override ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken) 
+        => new(GetToken(requestContext, cancellationToken));
+}
+
+public class ResetBaseUriTransport(Uri baseUri, HttpPipelineTransport innerTransport) : HttpPipelineTransport
+{
+    public override Request CreateRequest() => innerTransport.CreateRequest();
+
+    public override void Process(HttpMessage message)
     {
-        var server = new FauxDoorServer(Array.Empty<string>());
-        await server.Start();
-        return new FauxDoorFixture(server);
+        ChangeUri(message);
+        innerTransport.Process(message);
     }
-
-    public async ValueTask DisposeAsync()
+    public override ValueTask ProcessAsync(HttpMessage message)
     {
-        await _server.Stop();
+        ChangeUri(message);
+        return innerTransport.ProcessAsync(message);
     }
-
-    private static bool RunningInContainer()
+    private void ChangeUri(HttpMessage message)
     {
-        _ = bool.TryParse(
-            Environment.GetEnvironmentVariable("DOTNET_RUNNING_IN_CONTAINER"),
-            out var runningInContainer
-        );
-        return runningInContainer;
+        var originalUri = message.Request.Uri.ToUri();
+        var relativeUri = originalUri.PathAndQuery;
+        var newUri      = new Uri(baseUri, relativeUri);
+        message.Request.Uri.Reset(newUri);
     }
-
 }
